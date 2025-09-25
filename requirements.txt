@@ -1,0 +1,7 @@
+gymnasium
+mujoco>=3.0.0
+numpy
+stable-baselines3[extra]         # TensorBoard, 평가 콜백 등 포함
+tensorboard
+matplotlib
+pandas
