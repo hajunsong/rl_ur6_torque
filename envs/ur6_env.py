@@ -4,6 +4,7 @@ import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 import mujoco as mj
+from mujoco import viewer
 from utils.mj_utils import get_site_pos_vel, get_pos_jacobian, actuator_tau_limits
 from controllers.osc import OperationalSpaceController
 
@@ -13,20 +14,22 @@ class UR6TorqueEEEnv(gym.Env):
     관측: [q, qdot, x_ee, x_goal]
     보상: -||x_ee - x_goal||,   done: 거리 < thresh 또는 타임아웃
     """
-    metadata = {"render_modes": ["human", "none"]}
+    # metadata = {"render_modes": ["human", "none"]}
+    metadata = {"render_modes" : ["human", "rgb_array", "none"]}
 
     def __init__(self,
                  model_path="assets/ur10e/scene.xml",
                  eef_site="ee_site",
                  frame_skip=10,
                  render_mode=None,
-                 dx_limit=0.01,                 # 한 스텝 목표변위 한계 (m)
+                 dx_limit=0.03,                 # 한 스텝 목표변위 한계 (m)
                  goal_box=((-0.5, -0.5, 0.1), (0.5, 0.5, 0.8)),
                  kp=500.0, kd=40.0, kq=1.0):
+        
         super().__init__()
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"MuJoCo model not found: {model_path}")
-        
+
         self.model = mj.MjModel.from_xml_path(model_path)
         self.data = mj.MjData(self.model)
         mj.mj_forward(self.model, self.data)
@@ -39,6 +42,8 @@ class UR6TorqueEEEnv(gym.Env):
         self.nq = self.model.nq
         self.nv = self.model.nv
         self.nu = self.model.nu
+
+        self.goal_box = goal_box
 
         # 작업공간 컨트롤러
         self.osc = OperationalSpaceController(
@@ -61,10 +66,10 @@ class UR6TorqueEEEnv(gym.Env):
         # 목표 & 내부 상태
         self.reset(seed=None)
 
-        self.render_mode = render_mode
-        self.renderer = None
-        if self.render_mode == "rgb_array":
-            self.renderer = mj.Renderer(self.model, 640, 480)  # 해상도 자유
+        self._viewer = None
+        self._renderer = None
+        self._render_width = 960
+        self._render_height = 720
 
     def seed(self, seed=None):
         if seed is not None:
@@ -73,22 +78,38 @@ class UR6TorqueEEEnv(gym.Env):
     def _sample_goal(self):
         low, high = np.array(self.goal_box[0]), np.array(self.goal_box[1])
         return np.random.uniform(low=low, high=high).astype(np.float32)
+    
+    def set_goal(self, x_goal):
+        # 외부에서 임의 목표를 지정할 때 사용
+        x_goal = np.asarray(x_goal, dtype=np.float32)
+        # 워크스페이스로 안전 클리핑
+        low, high = np.array(self.goal_box[0]), np.array(self.goal_box[1])
+        self.x_goal = np.minimum(np.maximum(x_goal, low), high)
+        return self.x_goal
 
     def reset(self, seed=None, options=None):
         self.seed(seed)
         # 초기자세 (Menagerie 기본값 사용; 필요시 data.qpos 세팅)
-        self.data.qpos[:] = 0.0
+        home = np.deg2rad([0, -90, 90, -90, -90, 0])   # UR 시리즈 전형적인 ready pose
+        self.data.qpos[:6] = home
         self.data.qvel[:] = 0.0
         mj.mj_forward(self.model, self.data)
 
         # 현재 EEF 위치/목표 설정
-        self.goal_box = ((-0.4, -0.4, 0.2), (0.4, 0.4, 0.8))
         x, _ = get_site_pos_vel(self.model, self.data, self.eef_site)
-        self.x_des = x.copy()                         # 시작은 현재 위치
-        self.x_goal = self._sample_goal()
+        self.x_des = x.copy()
+
+        # ★ 하드코딩 삭제하고, 옵션 우선 → 없으면 샘플링
+        if options is not None and "x_goal" in options:
+            self.set_goal(options["x_goal"])
+        else:
+            self.x_goal = self._sample_goal()
 
         obs = self._get_obs()
         info = {}
+
+        self._succ_k = 0
+        self._t = 0
         return obs, info
 
     def _get_obs(self):
@@ -110,34 +131,56 @@ class UR6TorqueEEEnv(gym.Env):
         tau, e = self.osc(
             x=x, xd=xd, Jx=Jx, qdot=self.data.qvel.copy(),
             x_des=self.x_des, xd_des=np.zeros(3),
-            tau_limit=(self.tau_low, self.tau_high)
+            tau_limit=(self.tau_low, self.tau_high),
+            qfrc_bias=self.data.qfrc_bias.copy()
         )
 
         # 4) 시뮬레이션 진행
-        self.data.ctrl[:] = tau
+        # self.data.ctrl[:] = ta
+        self.data.qfrc_applied[:len(tau)] = tau
         for _ in range(self.frame_skip):
             mj.mj_step(self.model, self.data)
-
+        self.data.qfrc_applied[:] = 0.0
         # 5) 보상/종료
         x_new, _ = get_site_pos_vel(self.model, self.data, self.eef_site)
         dist = np.linalg.norm(x_new - self.x_goal)
         reward = -dist
-        terminated = dist < 0.02
+        terminated = dist < self.dx_limit
         truncated = False
 
         obs = self._get_obs()
-        info = {
-            "dist": dist,
-            "x_ee": x_new.copy(),        # ★ EEF 좌표를 info로 함께 로깅
-            "x_goal": self.x_goal.copy()
-        }
+        info = {"dist": dist}
+
+        if self.render_mode == "human":
+            self.render()
+        
         return obs, reward, terminated, truncated, info
 
     def render(self):
-        if self.render_mode != "rgb_array" or self.renderer is None:
-            return
-        self.renderer.update_scene(self.data)
-        return self.renderer.render()
+        if self.render_mode == "human":
+            # 인터랙티브 뷰어 창
+            if self._viewer is None:
+                # 패시브 모드: 우리가 mj_step을 돌리고, 뷰어는 동기화만
+                self._viewer = viewer.launch_passive(self.model, self.data)
+            # 현재 data 상태를 창에 반영
+            self._viewer.sync()
+            return None
+
+        elif self.render_mode == "rgb_array":
+            # 프레임 버퍼 렌더 → numpy 이미지 반환
+            if self._renderer is None:
+                self._renderer = mj.Renderer(self.model, self._render_width, self._render_height)
+            self._renderer.update_scene(self.data)
+            rgb = self._renderer.render()
+            return rgb
+
+        else:
+            return None
 
     def close(self):
-        self.renderer = None
+        if self._viewer is not None:
+            self._viewer.close()
+            self._viewer = None
+        if self._renderer is not None:
+            self._renderer.close()
+            self._renderer = None

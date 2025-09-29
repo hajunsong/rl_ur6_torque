@@ -120,7 +120,8 @@
                   <joint name="wrist_3_joint" class="size2"/>
                   <geom material="linkgray" mesh="wrist3" class="visual"/>
                   <geom class="eef_collision" pos="0 0.097 0" quat="1 1 0 0" size="0.046 0.02"/>
-                  <site name="attachment_site" pos="0 0.1 0" quat="-1 1 0 0"/>
+                  <!-- <site name="attachment_site" pos="0 0.1 0" quat="-1 1 0 0"/> -->
+                  <site name="ee_site" pos="0 0 0.0" size="0.006" rgba="0 1 0 1"/>
                 </body>
               </body>
             </body>
@@ -130,13 +131,25 @@
     </body>
   </worldbody>
 
-  <actuator>
+
+
+  <!-- <actuator>
     <general class="size4" name="shoulder_pan" joint="shoulder_pan_joint"/>
     <general class="size4" name="shoulder_lift" joint="shoulder_lift_joint"/>
     <general class="size3_limited" name="elbow" joint="elbow_joint"/>
     <general class="size2" name="wrist_1" joint="wrist_1_joint"/>
     <general class="size2" name="wrist_2" joint="wrist_2_joint"/>
     <general class="size2" name="wrist_3" joint="wrist_3_joint"/>
+  </actuator> -->
+
+  <actuator>
+    <!-- gear=1 이면 ctrl 단위가 N·m. 범위를 현실적으로 크게 -->
+    <motor joint="shoulder_pan_joint"   gear="1" ctrllimited="true" ctrlrange="-200 200"/>
+    <motor joint="shoulder_lift_joint"  gear="1" ctrllimited="true" ctrlrange="-200 200"/>
+    <motor joint="elbow_joint"          gear="1" ctrllimited="true" ctrlrange="-120 120"/>
+    <motor joint="wrist_1_joint"        gear="1" ctrllimited="true" ctrlrange="-80 80"/>
+    <motor joint="wrist_2_joint"        gear="1" ctrllimited="true" ctrlrange="-80 80"/>
+    <motor joint="wrist_3_joint"        gear="1" ctrllimited="true" ctrlrange="-40 40"/>
   </actuator>
 
   <keyframe>
