@@ -9,15 +9,18 @@ if __name__ == "__main__":
         model_path="/home/keti/Project/12_FieldSensor/rl_ur6_torque/assets/ur10e/scene.xml",
         eef_site="ee_site",
         frame_skip=5,
-        kp=300.0, kd=30.0, kq=15.0,
+        kp=400.0, kd=80.0, kq=1.0,
         render_mode="human",
-        dx_limit=0.001,
-        goal_box=((-1.1, -1.3, -0.3), (1.6, 1.3, 2.8)),  # 내 작업공간 설정
-        success_radius=0.002,        # 1 cm
+        dx_limit=0.004,
+        goal_box=((-1.2, -0.8, 0.05), (1.2, 0.8, 1.2)),  # 내 작업공간 설정
+        success_radius=0.005,
         success_hold_steps=5,       # 5스텝 연속 유지 후 성공
-        hold_at_goal=False,
-        max_steps=500,
-        ori_control=True
+        hold_at_goal=True,
+        max_steps=300,
+        ik_lambda = 1e-3,
+        ik_iters = 10,
+        auto_track_alpha = 0.2,
+        posture_weight = 5e-2
     )
 
     fixed_goal = np.array([-0.65, -0.2, 0.85], dtype=np.float32)
