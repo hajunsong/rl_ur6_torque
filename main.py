@@ -9,13 +9,18 @@ if __name__ == "__main__":
         model_path="/home/keti/Project/12_FieldSensor/rl_ur6_torque/assets/ur10e/scene.xml",
         eef_site="ee_site",
         frame_skip=5,
-        kp=600.0, kd=60.0, kq=2.0,
+        kp=300.0, kd=30.0, kq=15.0,
         render_mode="human",
         dx_limit=0.001,
-        goal_box=((-1.1, -1.3, -0.3), (1.6, 1.3, 2.8))  # 내 작업공간 설정
+        goal_box=((-1.1, -1.3, -0.3), (1.6, 1.3, 2.8)),  # 내 작업공간 설정
+        success_radius=0.002,        # 1 cm
+        success_hold_steps=5,       # 5스텝 연속 유지 후 성공
+        hold_at_goal=False,
+        max_steps=500,
+        ori_control=True
     )
 
-    fixed_goal = np.array([-0.85, -0.2, 0.85], dtype=np.float32)
+    fixed_goal = np.array([-0.65, -0.2, 0.85], dtype=np.float32)
     obs, info = env.reset(seed=0, options={"x_goal": fixed_goal})
 
     episode = 1
@@ -23,14 +28,15 @@ if __name__ == "__main__":
         nv = env.model.nv
         x = obs[2*nv:2*nv+3]
         x_goal = obs[2*nv+3:2*nv+6]
+        dist = np.linalg.norm(x_goal - x)
 
-        dx = np.clip(x_goal - x, -0.001, 0.001).astype(np.float32)
+        dx = np.clip(x_goal - x, -env.dx_limit, env.dx_limit).astype(np.float32)
 
         obs, reward, terminated, truncated, info = env.step(dx)
         env.render()
 
         if (step+1) % 100 == 0:
-            print(f"step {step+1}, dist={info['dist']:.3f}, reward={reward:.3f}")
+            print(f"step {step+1}, dist={info['dist']:.3f}, |tau|={info['tau_norm']:.2f}, |xd|={info['xd_norm']:.3f}")
             print("EEF pos =", x, " | goal =", x_goal)
 
         if terminated or truncated:
