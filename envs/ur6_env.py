@@ -12,9 +12,9 @@ import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 import mujoco as mj
-from mujoco import viewer
 
 from utils.mj_utils import get_site_pos_vel, get_pos_jacobian, actuator_tau_limits
+from utils.mj_utils import quat_err_vec, get_site_pose_vel
 
 class UR6TorqueEEEnv(gym.Env):
     """
@@ -57,7 +57,13 @@ class UR6TorqueEEEnv(gym.Env):
         # posture regularization (nullspace)
         posture_weight: float = 1e-2,
         # auto tracking toward goal (helps when policy actions are small)
-        auto_track_alpha: float = 0.2
+        auto_track_alpha: float = 0.2,
+        # 회전 오차를 작업오차에 섞을 때의 스케일
+        ori_gain_task: float = 1.0,
+        # 성공 판정용 각오차 임계 (rad : ~1.7도)
+        success_ori: float = 0.03,
+        # 자세 오차 가중치
+        ori_weight: float = 0.2
     ):
         super().__init__()
 
@@ -86,8 +92,11 @@ class UR6TorqueEEEnv(gym.Env):
         self.action_space = spaces.Box(low=-act_high, high=act_high, dtype=np.float32)
 
         # observation space: q(nv) + qdot(nv) + x(3) + goal(3)
-        obs_high = np.inf*np.ones(self.nv + self.nv + 3 + 3, dtype=np.float32)
+        # obs_high = np.inf*np.ones(self.nv + self.nv + 3 + 3, dtype=np.float32)
+        # self.observation_space = spaces.Box(low=-obs_high, high=obs_high, dtype=np.float32)
+        obs_high = np.inf * np.ones(self.nv + self.nv + 3 + 4 + 3, dtype=np.float32)
         self.observation_space = spaces.Box(low=-obs_high, high=obs_high, dtype=np.float32)
+
 
         # torque limits from actuators
         self.tau_low, self.tau_high = actuator_tau_limits(self.model)
@@ -122,8 +131,16 @@ class UR6TorqueEEEnv(gym.Env):
         # renderers
         self._viewer = None
         self._renderer = None
-        self._render_width = 960
-        self._render_height = 720
+        self._render_width = 480    
+        self._render_height = 640
+
+        self.ori_gain_task = float(ori_gain_task)
+        self.success_ori = float(success_ori)
+
+        # 목표 쿼터니언 상태 저장용
+        self.q_goal = None
+
+        self.ori_weight = float(ori_weight)
 
     # --------------------------- helpers ---------------------------
 
@@ -145,7 +162,17 @@ class UR6TorqueEEEnv(gym.Env):
         q = self.data.qpos.copy()
         qd = self.data.qvel.copy()
         x, _ = get_site_pos_vel(self.model, self.data, self.eef_site)
-        return np.concatenate([q, qd, x, self.x_goal]).astype(np.float32)
+        q_cur = self._get_site_quat(self.eef_site)
+        return np.concatenate([q, qd, x, q_cur, self.x_goal, self.q_goal]).astype(np.float32)
+    
+    def _get_site_quat(self, site_name: str):
+        """Return site orientation as quaternion [w, x, y, z]."""
+        sid = mj.mj_name2id(self.model, mj.mjtObj.mjOBJ_SITE, site_name)
+        # site_xmat는 3x3 회전행렬이 9개 원소로 평탄화되어 저장됨
+        mat9 = np.array(self.data.site_xmat[sid], dtype=np.float64)
+        quat = np.empty(4, dtype=np.float64)
+        mj.mju_mat2Quat(quat, mat9)   # MuJoCo util: R(9) -> quat(4)
+        return quat
 
     # --------------------------- gym API ---------------------------
 
@@ -167,6 +194,12 @@ class UR6TorqueEEEnv(gym.Env):
         x, _ = get_site_pos_vel(self.model, self.data, self.eef_site)
         self.x_des = x.copy()
 
+        _, _, quat, _, _, _ = get_site_pose_vel(self.model, self.data, self.eef_site)
+        if options is not None and "q_goal" in options and options["q_goal"] is not None:
+            self.q_goal = options.get("q_goal")
+        else:
+            self.q_goal = self._get_site_quat(self.eef_site).copy()
+
         self._succ_k = 0
         self._t = 0
 
@@ -176,8 +209,11 @@ class UR6TorqueEEEnv(gym.Env):
 
     def step(self, action):
         # ------------- read state -------------
-        x, xd = get_site_pos_vel(self.model, self.data, self.eef_site)
-        dist = float(np.linalg.norm(x - self.x_goal))
+        x, xd, q_cur, omega, Jp, Jr = get_site_pose_vel(self.model, self.data, self.eef_site)
+        e_p = self.x_goal - x
+        e_o = quat_err_vec(self.q_goal, q_cur)
+        dist = float(np.linalg.norm(e_p))
+        ori_norm = float(np.linalg.norm(e_o))
 
         # ------------- action integration -------------
         action = np.asarray(action, dtype=np.float32).reshape(3)
@@ -190,7 +226,7 @@ class UR6TorqueEEEnv(gym.Env):
         )
 
         # deadband hold: if close, pin x_des to goal
-        if self.hold_at_goal and dist < self.success_radius:
+        if self.hold_at_goal and (dist < self.success_radius and ori_norm < self.success_ori):
             self.x_des = self.x_goal.copy()
             dx_cmd = np.zeros(3, dtype=np.float32)
         else:
@@ -198,7 +234,7 @@ class UR6TorqueEEEnv(gym.Env):
 
         # x_des update & workspace clip
         self.x_des = self._clip_to_workspace(self.x_des + dx_cmd)
-
+        
         # ------------- Multi-iter DLS IK + posture nullspace -------------
         q = self.data.qpos.copy()
         qd = self.data.qvel.copy()
@@ -207,21 +243,28 @@ class UR6TorqueEEEnv(gym.Env):
 
         q_d = q.copy()
         for _ in range(self.ik_iters):
-            # forward (fresh pose)
-            x_now, _ = get_site_pos_vel(self.model, self.data, self.eef_site)
-            dx_task = (self.x_des - x_now) * self.ik_step_scale
+            # 최신 포즈/자코비안으로 선형화
+            x_now, xd_now, q_now, omega_now, Jp, Jr = get_site_pose_vel(self.model, self.data, self.eef_site)
+            e_o_now = quat_err_vec(self.q_goal, q_now)
 
-            Jx = get_pos_jacobian(self.model, self.data, self.eef_site)  # (3, nv)
-            JJt = Jx @ Jx.T + (self.ik_lambda**2) * np.eye(3)
-            invJJt = np.linalg.inv(JJt)
-            Jplus = Jx.T @ invJJt                                       # (nv,3)
+            # 6D 작업오차: [위치; 회전]  (회전은 스케일 ori_gain_task)
+            dx_lin = (self.x_des - x_now) * self.ik_step_scale   # (3,)
+            dx_ang = self.ori_gain_task * e_o_now                # (3,)
+            dx_task = np.concatenate([dx_lin, dx_ang])           # (6,)
 
-            # posture/nullspace bias
-            N = I - Jplus @ Jx
+            # 6×nv 자코비안
+            J6 = np.vstack([Jp, Jr])                             # (6, nv)
+
+            # DLS (필요시 작은 정규화)
+            JJt = J6 @ J6.T + (self.ik_lambda**2) * np.eye(6)
+            Jplus = J6.T @ np.linalg.inv(JJt)
+
+            # nullspace posture bias
+            N = I - Jplus @ J6
             dq = Jplus @ dx_task + self.posture_weight * (N @ (self.q_home - q_d))
 
-            q_d[:len(dq)] = q_d[:len(dq)] + dq
-            # temporarily write q_d to data for better linearization in next IK iter
+            q_d[:len(dq)] += dq
+            # 선형화 갱신을 위해 일시 적용
             self.data.qpos[:len(q_d)] = q_d
             mj.mj_forward(self.model, self.data)
 
@@ -248,13 +291,21 @@ class UR6TorqueEEEnv(gym.Env):
             mj.mj_step(self.model, self.data)
 
         # ------------- outputs -------------
-        x_next, xd_next = get_site_pos_vel(self.model, self.data, self.eef_site)
-        dist = float(np.linalg.norm(x_next - self.x_goal))
-        reward = -dist
+        # x_next, xd_next = get_site_pos_vel(self.model, self.data, self.eef_site)
+        # dist = float(np.linalg.norm(x_next - self.x_goal))
+        # reward = -dist
+        x_next, xd_next, q_next, omega_next, _, _ = get_site_pose_vel(self.model, self.data, self.eef_site)
+        e_p_next = self.x_goal - x_next
+        e_o_next = quat_err_vec(self.q_goal, q_next)
+        dist = float(np.linalg.norm(e_p_next))
+        ori_norm = float(np.linalg.norm(e_o_next))
+
+        # 보상에 각오차를 살짝 페널티로 줄 수도 있음
+        reward = -dist - self.ori_weight * ori_norm
         self._t += 1
 
-        # success counting
-        if dist < self.success_radius:
+        # 성공 판정: 위치 + 자세
+        if dist < self.success_radius and ori_norm < self.success_ori:
             self._succ_k += 1
         else:
             self._succ_k = 0
@@ -271,6 +322,7 @@ class UR6TorqueEEEnv(gym.Env):
 
         info = {
             "dist": dist,
+            "ori_err": ori_norm,
             "tau_norm": float(np.linalg.norm(tau)),
             "xd_norm": float(np.linalg.norm(xd_next)),
         }
@@ -281,17 +333,44 @@ class UR6TorqueEEEnv(gym.Env):
 
     def render(self):
         if self.render_mode == "human":
+            try:
+                from mujoco import viewer
+            except Exception as e:
+                raise RuntimeError(
+                    "On-screen viewer unavailable. Use render_mode='rgb_array' and MUJOCO_GL=egl/osmesa."
+                ) from e
             if self._viewer is None:
                 self._viewer = viewer.launch_passive(self.model, self.data)
             self._viewer.sync()
             return None
+
         elif self.render_mode == "rgb_array":
             from mujoco import Renderer
-            if self._renderer is None:
-                self._renderer = Renderer(self.model)
+            # 모델의 offscreen framebuffer 한계(기본 640x480)를 읽음
+            try:
+                offw  = int(getattr(self.model.vis.global_, "offwidth",  640))
+                offh  = int(getattr(self.model.vis.global_, "offheight", 480))
+            except Exception:
+                offw, offh = 640, 480
+
+            # 절대적으로 프레임버퍼를 넘지 않도록 하드 캡
+            req_w = min(int(self._render_width),  offw)
+            req_h = min(int(self._render_height), offh)
+
+            # 이미 만들어둔 렌더러가 있더라도, 크기가 바뀌면 재생성
+            if (self._renderer is None or 
+                getattr(self._renderer, "width", None)  != req_w or
+                getattr(self._renderer, "height", None) != req_h):
+                # 이전 컨텍스트 정리
+                if self._renderer is not None:
+                    try: self._renderer.close()
+                    except: pass
+                self._renderer = Renderer(self.model, req_w, req_h)
+
             self._renderer.update_scene(self.data)
             rgb = self._renderer.render()
             return rgb
+
         else:
             return None
 
