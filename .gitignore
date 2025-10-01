@@ -1,4 +1,5 @@
 .venv
 logs/
 runs/
-videos/
+videos/*
+plot/*
